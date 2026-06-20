@@ -1,5 +1,5 @@
-import Dexie from 'https://cdn.jsdelivr.net/npm/dexie@4/+esm';
-import { exportDB, importInto } from 'https://cdn.jsdelivr.net/npm/dexie-export-import@4/+esm';
+import Dexie from 'https://esm.sh/dexie@4';
+import { exportDB, importInto } from 'https://esm.sh/dexie-export-import@4';
 import { computeAggregate } from './aggregate.js';
 export { getDaBucket, getPowerBucket, DA_BUCKETS, DA_TOL, PWR_BUCKETS, PWR_TOL } from './buckets.js';
 
