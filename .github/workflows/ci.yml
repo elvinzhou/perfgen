@@ -89,7 +89,7 @@ jobs:
         run: npm ci
 
       - name: Deploy to Cloudflare Pages
-        run: npx wrangler pages deploy public/ --project-name perfgen
+        run: npx wrangler pages deploy public/ --project-name perfgen --commit-dirty=true
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
