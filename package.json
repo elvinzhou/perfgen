@@ -1,0 +1,13 @@
+{
+  "name": "perfgen",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build:wasm": "wasm-pack build wasm-engine --target web --out-dir ../public/wasm --no-typescript",
+    "dev": "npx serve public -p 8080",
+    "build": "npm run build:wasm"
+  },
+  "devDependencies": {
+    "serve": "^14.2.0"
+  }
+}
