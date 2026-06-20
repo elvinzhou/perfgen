@@ -1,6 +1,5 @@
 name = "perfgen"
-main = "worker/src/index.ts"
 compatibility_date = "2024-01-01"
 
-[site]
-bucket = "./public"
+[pages_build_output_dir]
+output_dir = "./public"
