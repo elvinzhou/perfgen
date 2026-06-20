@@ -3,8 +3,8 @@ import {
   saveFlight, listFlights, deleteFlight,
   addPerformanceRecords, getAggregateMatrix,
   exportDatabase, importDatabase,
-  DA_BUCKETS, PWR_BUCKETS, getDaBucket, getPowerBucket,
 } from './db.js';
+import { DA_BUCKETS, PWR_BUCKETS, getDaBucket, getPowerBucket } from './buckets.js';
 import { processCSV, loadWasm } from './wasm-bridge.js';
 
 // ── State ─────────────────────────────────────────────────────────────────────

@@ -261,10 +261,9 @@ fn get_f64(cols: &[&str], idx: usize) -> f64 {
         .unwrap_or(f64::NAN)
 }
 
-// ── Public entry point ────────────────────────────────────────────────────────
+// ── Core processing (native-testable) ────────────────────────────────────────
 
-#[wasm_bindgen]
-pub fn process_csv(csv_data: &str, _max_hp: f64) -> JsValue {
+pub fn process_csv_inner(csv_data: &str, _max_hp: f64) -> ProcessingResult {
     let mut result = ProcessingResult {
         steady_state_blocks: Vec::new(),
         total_records: 0,
@@ -275,7 +274,7 @@ pub fn process_csv(csv_data: &str, _max_hp: f64) -> JsValue {
     let lines: Vec<&str> = csv_data.lines().collect();
     if lines.is_empty() {
         result.error = Some("Empty CSV file".to_string());
-        return serde_wasm_bindgen::to_value(&result).unwrap();
+        return result;
     }
 
     // Find the short-name header row (contains "Lcl Date" or similar)
@@ -297,7 +296,7 @@ pub fn process_csv(csv_data: &str, _max_hp: f64) -> JsValue {
         Some(i) => i,
         None => {
             result.error = Some("Cannot find header row (expected 'Lcl Date' column)".to_string());
-            return serde_wasm_bindgen::to_value(&result).unwrap();
+            return result;
         }
     };
 
@@ -347,7 +346,7 @@ pub fn process_csv(csv_data: &str, _max_hp: f64) -> JsValue {
     for (name, col) in required {
         if col.is_none() {
             result.error = Some(format!("Missing required column: {}", name));
-            return serde_wasm_bindgen::to_value(&result).unwrap();
+            return result;
         }
     }
 
@@ -425,7 +424,7 @@ pub fn process_csv(csv_data: &str, _max_hp: f64) -> JsValue {
             records.len(),
             WINDOW_SECONDS
         ));
-        return serde_wasm_bindgen::to_value(&result).unwrap();
+        return result;
     }
 
     // Sliding window steady-state detection
@@ -451,5 +450,214 @@ pub fn process_csv(csv_data: &str, _max_hp: f64) -> JsValue {
         result.steady_state_blocks.push(build_result(&average_block(block)));
     }
 
-    serde_wasm_bindgen::to_value(&result).unwrap()
+    result
+}
+
+// ── Wasm entry point (thin wrapper, wasm32 only) ──────────────────────────────
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn process_csv(csv_data: &str, max_hp: f64) -> JsValue {
+    serde_wasm_bindgen::to_value(&process_csv_inner(csv_data, max_hp)).unwrap()
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Atmospheric math ──────────────────────────────────────────────────────
+
+    #[test]
+    fn isa_temp_sea_level() {
+        assert!((isa_temp(0.0) - 15.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn isa_temp_at_altitude() {
+        // 10,000 ft: 15 - 0.0019812*10000 = 15 - 19.812 = -4.812
+        assert!((isa_temp(10_000.0) - (-4.812)).abs() < 0.001);
+    }
+
+    #[test]
+    fn density_alt_equals_pressure_alt_on_standard_day() {
+        // On a standard day (OAT = ISA), DA should equal PA
+        let pa = 8_000.0;
+        let oat = isa_temp(pa);
+        let da = density_altitude_from_pa(pa, oat);
+        assert!((da - pa).abs() < 1.0, "DA {da} should ≈ PA {pa} on standard day");
+    }
+
+    #[test]
+    fn density_alt_higher_on_hot_day() {
+        let pa = 8_000.0;
+        let da_hot  = density_altitude_from_pa(pa, isa_temp(pa) + 20.0);
+        let da_cold = density_altitude_from_pa(pa, isa_temp(pa) - 20.0);
+        assert!(da_hot > pa,  "Hot day DA should exceed PA");
+        assert!(da_cold < pa, "Cold day DA should be below PA");
+    }
+
+    #[test]
+    fn tas_equals_ias_at_sea_level_standard() {
+        // sigma = 1 at sea level ISA → TAS = IAS
+        let tas = tas_from_ias(100.0, 0.0, 15.0);
+        assert!((tas - 100.0).abs() < 0.1, "TAS {tas} should ≈ 100 kts at SL standard");
+    }
+
+    #[test]
+    fn tas_exceeds_ias_at_altitude() {
+        let tas = tas_from_ias(100.0, 8_000.0, isa_temp(8_000.0));
+        assert!(tas > 100.0, "TAS {tas} should exceed IAS at altitude");
+    }
+
+    // ── Steady-state detection ────────────────────────────────────────────────
+
+    fn make_record(alt: f64, ias: f64, rpm: f64, map: f64, roll: f64) -> G3xRecord {
+        G3xRecord {
+            timestamp: String::new(),
+            pres_alt: alt, ias, tas: f64::NAN, oat: 5.0, da: f64::NAN,
+            gnd_spd: ias, pitch: 1.0, roll, map_inhg: map, rpm,
+            fuel_flow_gph: 12.0, pwr_pct: 65.0, fqty_total: 40.0,
+            cht: vec![], egt: vec![],
+        }
+    }
+
+    fn stable_window(n: usize) -> Vec<G3xRecord> {
+        (0..n).map(|_| make_record(8000.0, 140.0, 2400.0, 22.5, 0.5)).collect()
+    }
+
+    #[test]
+    fn steady_state_passes_within_tolerances() {
+        assert!(is_steady_state(&stable_window(WINDOW_SECONDS)));
+    }
+
+    #[test]
+    fn steady_state_fails_too_short() {
+        assert!(!is_steady_state(&stable_window(WINDOW_SECONDS - 1)));
+    }
+
+    #[test]
+    fn steady_state_fails_altitude_exceedance() {
+        let mut win = stable_window(WINDOW_SECONDS);
+        win[10].pres_alt = 8000.0 + 101.0; // 101 ft swing > 100 ft range
+        assert!(!is_steady_state(&win));
+    }
+
+    #[test]
+    fn steady_state_passes_at_altitude_limit() {
+        let mut win = stable_window(WINDOW_SECONDS);
+        win[10].pres_alt = 8000.0 + 100.0; // exactly 100 ft → should pass
+        assert!(is_steady_state(&win));
+    }
+
+    #[test]
+    fn steady_state_fails_ias_exceedance() {
+        let mut win = stable_window(WINDOW_SECONDS);
+        win[10].ias = 140.0 + 4.1;
+        assert!(!is_steady_state(&win));
+    }
+
+    #[test]
+    fn steady_state_fails_rpm_exceedance() {
+        let mut win = stable_window(WINDOW_SECONDS);
+        win[10].rpm = 2400.0 + 41.0;
+        assert!(!is_steady_state(&win));
+    }
+
+    #[test]
+    fn steady_state_fails_map_exceedance() {
+        let mut win = stable_window(WINDOW_SECONDS);
+        win[10].map_inhg = 22.5 + 0.41;
+        assert!(!is_steady_state(&win));
+    }
+
+    #[test]
+    fn steady_state_fails_roll_exceedance() {
+        let mut win = stable_window(WINDOW_SECONDS);
+        win[10].roll = 3.1;
+        assert!(!is_steady_state(&win));
+    }
+
+    // ── CSV processing ────────────────────────────────────────────────────────
+
+    fn make_csv(rows: usize, alt: f64, ias: f64, map: f64, rpm: f64) -> String {
+        let header = "Lcl Date,Lcl Time,AltP,OAT,IAS,GndSpd,Pitch,Roll,E1 MAP,E1 RPM,E1 FFlow,E1 %Pwr";
+        let data: Vec<String> = (0..rows)
+            .map(|i| format!(
+                "2026-01-01,{:02}:{:02}:{:02},{},{},{},{},1.0,0.5,{},{},12.0,65",
+                i/3600, (i/60)%60, i%60, alt, -4.8, ias, ias, map, rpm
+            ))
+            .collect();
+        format!("{}\n{}", header, data.join("\n"))
+    }
+
+    #[test]
+    fn csv_missing_header_returns_error() {
+        let result = process_csv_inner("no,header,here\n1,2,3", 0.0);
+        assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn csv_too_short_returns_error() {
+        let csv = make_csv(100, 8000.0, 140.0, 22.5, 2400.0);
+        let result = process_csv_inner(&csv, 0.0);
+        assert!(result.error.is_some());
+        assert_eq!(result.steady_state_blocks.len(), 0);
+    }
+
+    #[test]
+    fn csv_stable_cruise_produces_one_block() {
+        let csv = make_csv(WINDOW_SECONDS + 10, 8000.0, 140.0, 22.5, 2400.0);
+        let result = process_csv_inner(&csv, 0.0);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(result.steady_state_blocks.len(), 1);
+    }
+
+    #[test]
+    fn csv_unstable_data_produces_no_blocks() {
+        // Altitude swings every row — never stable
+        let header = "Lcl Date,Lcl Time,AltP,OAT,IAS,GndSpd,Pitch,Roll,E1 MAP,E1 RPM,E1 FFlow,E1 %Pwr";
+        let data: Vec<String> = (0..300)
+            .map(|i| {
+                let alt = if i % 2 == 0 { 8000.0_f64 } else { 8200.0_f64 }; // 200 ft swing
+                format!("2026-01-01,00:{:02}:{:02},{},{},140,140,1,0,22.5,2400,12,65",
+                    i/60, i%60, alt, -4.8)
+            })
+            .collect();
+        let csv = format!("{}\n{}", header, data.join("\n"));
+        let result = process_csv_inner(&csv, 0.0);
+        assert_eq!(result.steady_state_blocks.len(), 0);
+    }
+
+    #[test]
+    fn csv_block_density_altitude_is_normalised() {
+        // ISA temp at 8000 ft = 15 - 0.0019812*8000 = -0.8496°C
+        // so use OAT = -0.85 to get DA ≈ PA (standard day)
+        let header = "Lcl Date,Lcl Time,AltP,OAT,IAS,GndSpd,Pitch,Roll,E1 MAP,E1 RPM,E1 FFlow,E1 %Pwr";
+        let data: Vec<String> = (0..WINDOW_SECONDS + 50)
+            .map(|i| format!(
+                "2026-01-01,{:02}:{:02}:{:02},{},{},{},{},1.0,0.5,{},{},12.0,65",
+                i/3600, (i/60)%60, i%60, 8000.0, -0.85_f64, 140.0, 140.0, 22.5, 2400.0
+            ))
+            .collect();
+        let csv = format!("{}\n{}", header, data.join("\n"));
+        let result = process_csv_inner(&csv, 0.0);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(result.steady_state_blocks.len(), 1);
+        let block = &result.steady_state_blocks[0];
+        // Standard day → DA should equal PA within a few feet
+        assert!((block.density_altitude - 8000.0).abs() < 50.0,
+            "DA {} should be ≈ 8000 ft on standard day", block.density_altitude);
+    }
+
+    #[test]
+    fn csv_specific_range_computed() {
+        let csv = make_csv(WINDOW_SECONDS + 10, 8000.0, 140.0, 22.5, 2400.0);
+        let result = process_csv_inner(&csv, 0.0);
+        let block = &result.steady_state_blocks[0];
+        // GndSpd = IAS = 140, FFlow = 12 → SR = 140/12 ≈ 11.67
+        assert!((block.specific_range - (140.0 / 12.0)).abs() < 0.5,
+            "SR {} should ≈ {}", block.specific_range, 140.0/12.0);
+    }
 }
