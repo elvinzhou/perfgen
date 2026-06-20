@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  # ── Rust unit tests + Wasm build verification ──────────────────────────────
+  # ── Rust unit tests + Wasm build ──────────────────────────────────────────
   rust:
     name: Rust tests & Wasm build
     runs-on: ubuntu-latest
@@ -35,8 +35,15 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-      - name: Build Wasm (verify it compiles cleanly)
+      - name: Build Wasm
         run: wasm-pack build wasm-engine --target web --out-dir ../public/wasm --no-typescript
+
+      - name: Upload Wasm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-build
+          path: public/wasm/
+          retention-days: 1
 
   # ── JavaScript unit tests ──────────────────────────────────────────────────
   js:
@@ -56,3 +63,33 @@ jobs:
 
       - name: Run Vitest
         run: npm test
+
+  # ── Deploy to Cloudflare Pages (main branch only) ─────────────────────────
+  deploy:
+    name: Deploy to Cloudflare Pages
+    needs: [rust, js]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Wasm artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-build
+          path: public/wasm/
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Deploy to Cloudflare Pages
+        run: npx wrangler pages deploy public/ --project-name perfgen
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
