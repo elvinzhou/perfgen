@@ -83,17 +83,21 @@
 
     <!-- Matrix Stats -->
     <div id="matrix-stats" class="bg-gray-800 rounded-lg p-3 text-sm space-y-2">
-      <h3 class="font-semibold text-gray-300 text-xs uppercase tracking-wider">Matrix Coverage</h3>
+      <h3 class="font-semibold text-gray-300 text-xs uppercase tracking-wider">Living POH Status</h3>
       <div class="flex justify-between text-gray-400 text-xs">
-        <span>Filled</span>
+        <span>Total data points</span>
+        <span id="stat-samples" class="text-blue-400 font-bold">—</span>
+      </div>
+      <div class="flex justify-between text-gray-400 text-xs">
+        <span>Cells filled</span>
         <span id="stat-filled" class="text-green-400 font-bold">—</span>
       </div>
       <div class="flex justify-between text-gray-400 text-xs">
-        <span>Missing</span>
+        <span>Cells missing</span>
         <span id="stat-missing" class="text-yellow-400 font-bold">—</span>
       </div>
       <div class="flex justify-between text-gray-400 text-xs">
-        <span>Total Cells</span>
+        <span>Total cells</span>
         <span id="stat-total" class="text-gray-300">—</span>
       </div>
     </div>
@@ -107,12 +111,15 @@
   <!-- Main Content -->
   <main class="flex-1 overflow-auto p-6 bg-gray-950">
     <section id="matrix-section" class="hidden">
-      <div class="mb-4">
+      <div class="mb-3">
         <h2 class="text-lg font-bold text-white">Performance Matrix</h2>
         <p class="text-sm text-gray-400 mt-1">
-          Green cells have recorded data. Click a cell to view details. Empty cells indicate missing test points.
+          Each cell averages all steady-state blocks across every uploaded flight. More flights = more accurate values.
         </p>
       </div>
+
+      <!-- Chart type tabs -->
+      <div id="chart-tabs" class="flex gap-1 border-b border-gray-700 mb-4"></div>
 
       <div class="overflow-x-auto">
         <div id="performance-grid" class="min-w-max rounded-lg overflow-hidden border border-gray-700">
@@ -121,15 +128,24 @@
       </div>
 
       <!-- Legend -->
-      <div class="flex gap-6 mt-4 text-xs text-gray-400">
+      <div class="flex flex-wrap gap-6 mt-4 text-xs text-gray-400">
         <div class="flex items-center gap-2">
           <div class="w-4 h-4 rounded bg-green-900 border border-green-700"></div>
-          Data recorded
+          Normal / data present
+        </div>
+        <div class="flex items-center gap-2">
+          <div class="w-4 h-4 rounded bg-yellow-900 border border-yellow-700"></div>
+          CHT 390–419°F (caution)
+        </div>
+        <div class="flex items-center gap-2">
+          <div class="w-4 h-4 rounded bg-red-900 border border-red-700"></div>
+          CHT ≥420°F (hot)
         </div>
         <div class="flex items-center gap-2">
           <div class="w-4 h-4 rounded bg-gray-900 border border-gray-700"></div>
-          Missing data point
+          Missing — generate test card
         </div>
+        <div class="text-gray-500">N = number of steady-state blocks averaged</div>
       </div>
     </section>
 
@@ -230,20 +246,5 @@
 <div id="print-target" class="hidden p-8 text-black bg-white text-xs font-mono whitespace-pre"></div>
 
 <script type="module" src="/js/app.js"></script>
-<script>
-  // Keep welcome and matrix section in sync
-  const matrixSec = document.getElementById('matrix-section');
-  const welcomeSec = document.getElementById('welcome-state');
-  const sel = document.getElementById('select-aircraft');
-  sel.addEventListener('change', () => {
-    if (sel.value) {
-      matrixSec.classList.remove('hidden');
-      welcomeSec.classList.add('hidden');
-    } else {
-      matrixSec.classList.add('hidden');
-      welcomeSec.classList.remove('hidden');
-    }
-  });
-</script>
 </body>
 </html>

@@ -1,49 +1,80 @@
 import {
   db, saveAircraft, getAircraft, listAircraft, deleteAircraft,
   saveFlight, listFlights, deleteFlight,
-  upsertPerformanceRecords, getMatrixForAircraft,
+  addPerformanceRecords, getAggregateMatrix,
   exportDatabase, importDatabase,
-  DA_BUCKETS, DA_TOL, PWR_BUCKETS, PWR_TOL,
-  getDaBucket, getPowerBucket,
+  DA_BUCKETS, PWR_BUCKETS, getDaBucket, getPowerBucket,
 } from './db.js';
 import { processCSV, loadWasm } from './wasm-bridge.js';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let currentAircraftId = null;
-let matrixData = {};  // { "da_pwr": PerformanceRecord }
+let aggregateMatrix = {};   // key → aggregate cell data
+let activeTab = 'tas';      // 'tas' | 'range' | 'fuel' | 'cht'
+
+const TABS = [
+  { id: 'tas',   label: 'TAS',            unit: 'kts',     color: 'green'  },
+  { id: 'range', label: 'Specific Range', unit: 'nm/gal',  color: 'blue'   },
+  { id: 'fuel',  label: 'Fuel Burn',      unit: 'GPH',     color: 'purple' },
+  { id: 'cht',   label: 'Max CHT',        unit: '°F',      color: 'red'    },
+];
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
   await loadWasm().catch(() => {});
+  renderTabs();
   await renderAircraftList();
   bindEvents();
 });
 
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+function renderTabs() {
+  const container = document.getElementById('chart-tabs');
+  container.innerHTML = '';
+  for (const tab of TABS) {
+    const btn = document.createElement('button');
+    btn.dataset.tab = tab.id;
+    btn.className = [
+      'px-4 py-2 text-sm font-medium rounded-t-lg border-b-2 transition-colors whitespace-nowrap',
+      tab.id === activeTab
+        ? 'border-blue-400 text-blue-300 bg-gray-800'
+        : 'border-transparent text-gray-400 hover:text-gray-200 hover:bg-gray-800/50',
+    ].join(' ');
+    btn.textContent = `${tab.label} (${tab.unit})`;
+    btn.addEventListener('click', () => { activeTab = tab.id; renderTabs(); renderMatrix(); });
+    container.appendChild(btn);
+  }
+}
+
+// ── Events ────────────────────────────────────────────────────────────────────
 function bindEvents() {
   document.getElementById('btn-new-aircraft').addEventListener('click', () => showModal('modal-aircraft'));
   document.getElementById('form-aircraft').addEventListener('submit', onSaveAircraft);
   document.getElementById('btn-cancel-aircraft').addEventListener('click', () => hideModal('modal-aircraft'));
 
-  document.getElementById('btn-upload-csv').addEventListener('click', () => {
-    document.getElementById('input-csv').click();
-  });
+  document.getElementById('btn-upload-csv').addEventListener('click', () =>
+    document.getElementById('input-csv').click());
   document.getElementById('input-csv').addEventListener('change', onCSVSelected);
 
   document.getElementById('btn-export').addEventListener('click', exportDatabase);
-  document.getElementById('btn-import').addEventListener('click', () => document.getElementById('input-import').click());
+  document.getElementById('btn-import').addEventListener('click', () =>
+    document.getElementById('input-import').click());
   document.getElementById('input-import').addEventListener('change', onImport);
 
   document.getElementById('btn-print-card').addEventListener('click', onPrintTestCard);
+
+  document.addEventListener('click', e => {
+    if (e.target.id === 'btn-close-detail') hideModal('modal-detail');
+    if (e.target.id === 'btn-close-card') hideModal('modal-test-card');
+    if (e.target.id === 'btn-print') window.print();
+    if (e.target.id === 'btn-download-card') downloadCard();
+  });
 }
 
-// ── Aircraft Management ────────────────────────────────────────────────────────
-
+// ── Aircraft ──────────────────────────────────────────────────────────────────
 async function renderAircraftList() {
   const aircraft = await listAircraft();
   const select = document.getElementById('select-aircraft');
-  const empty = document.getElementById('no-aircraft');
-  const matrixSection = document.getElementById('matrix-section');
-
   select.innerHTML = '<option value="">-- Select Aircraft --</option>';
   aircraft.forEach(a => {
     const opt = document.createElement('option');
@@ -51,22 +82,13 @@ async function renderAircraftList() {
     opt.textContent = `${a.tailNumber} — ${a.model}`;
     select.appendChild(opt);
   });
-
-  if (aircraft.length === 0) {
-    empty.classList.remove('hidden');
-    matrixSection.classList.add('hidden');
-  } else {
-    empty.classList.add('hidden');
-  }
+  document.getElementById('no-aircraft').classList.toggle('hidden', aircraft.length > 0);
 
   select.addEventListener('change', async () => {
     currentAircraftId = select.value ? parseInt(select.value) : null;
-    if (currentAircraftId) {
-      await loadMatrix();
-      matrixSection.classList.remove('hidden');
-    } else {
-      matrixSection.classList.add('hidden');
-    }
+    document.getElementById('matrix-section').classList.toggle('hidden', !currentAircraftId);
+    document.getElementById('welcome-state').classList.toggle('hidden', !!currentAircraftId);
+    if (currentAircraftId) await loadMatrix();
   });
 }
 
@@ -80,8 +102,7 @@ async function onSaveAircraft(e) {
     notes: form['notes'].value.trim(),
     createdAt: new Date().toISOString(),
   };
-  const id = form.dataset.editId ? parseInt(form.dataset.editId) : undefined;
-  if (id) aircraft.id = id;
+  if (form.dataset.editId) aircraft.id = parseInt(form.dataset.editId);
   await saveAircraft(aircraft);
   form.reset();
   delete form.dataset.editId;
@@ -90,30 +111,23 @@ async function onSaveAircraft(e) {
   showToast(`Aircraft ${aircraft.tailNumber} saved.`);
 }
 
-// ── CSV Upload & Processing ───────────────────────────────────────────────────
-
+// ── CSV Upload ────────────────────────────────────────────────────────────────
 async function onCSVSelected(e) {
   const file = e.target.files[0];
   if (!file || !currentAircraftId) return;
   e.target.value = '';
 
   const aircraft = await getAircraft(currentAircraftId);
-  showToast('Processing CSV… this may take a moment.');
+  showToast('Processing CSV…');
 
   const text = await file.text();
   const result = await processCSV(text, aircraft.maxHp || 0);
 
-  if (result.error) {
-    showToast(`Error: ${result.error}`, 'error');
-    return;
+  if (result.error) { showToast(`Error: ${result.error}`, 'error'); return; }
+  if (!result.steady_state_blocks.length) {
+    showToast('No steady-state cruise phases found.', 'warn'); return;
   }
 
-  if (result.steady_state_blocks.length === 0) {
-    showToast('No steady-state cruise phases found in this log.', 'warn');
-    return;
-  }
-
-  // Map blocks to performance records and bucket them
   const flight = {
     id: `flight-${Date.now()}`,
     aircraftId: currentAircraftId,
@@ -127,10 +141,11 @@ async function onCSVSelected(e) {
   };
   await saveFlight(flight);
 
+  // Build performance records and accumulate into the matrix pool
   const perfRecords = [];
   for (const block of result.steady_state_blocks) {
     const daBucket = getDaBucket(block.density_altitude);
-    const ambientP = 29.92 * Math.pow(1 - 6.8755856e-6 * block.pressure_altitude, 5.2558797);
+    const ambientP = 29.92 * Math.pow(1 - 6.8755856e-6 * block.pres_alt, 5.2558797);
     const pwrBucket = getPowerBucket(block.power_percent, block.map_inhg, ambientP);
     if (!daBucket || !pwrBucket) continue;
 
@@ -145,40 +160,54 @@ async function onCSVSelected(e) {
       mapInhg: block.map_inhg,
       rpm: block.rpm,
       fuelFlowGph: block.fuel_flow_gph,
+      specificRange: block.specific_range,
       oat: block.oat,
-      weightLbs: 0,
+      chtMax: block.cht_max,
+      chtAvg: block.cht_avg,
+      chtSpread: block.cht_spread,
+      egtSpread: block.egt_spread,
+      cht: block.cht,
+      egt: block.egt,
       engines: [{
         engineIndex: 0,
         rpm: block.rpm,
         map: block.map_inhg,
         fuelFlowGph: block.fuel_flow_gph,
-        cht: [],
-        egt: [],
+        cht: block.cht,
+        egt: block.egt,
       }],
     });
   }
 
-  if (perfRecords.length > 0) {
-    await upsertPerformanceRecords(perfRecords);
-  }
+  if (perfRecords.length) await addPerformanceRecords(perfRecords);
 
-  showToast(`Processed: ${result.steady_state_blocks.length} steady-state blocks → ${perfRecords.length} matrix points added.`);
+  showToast(`Added ${perfRecords.length} data points from ${result.steady_state_blocks.length} steady-state blocks.`);
   await loadMatrix();
 }
 
-// ── Performance Matrix ────────────────────────────────────────────────────────
-
+// ── Aggregate Matrix ──────────────────────────────────────────────────────────
 async function loadMatrix() {
   if (!currentAircraftId) return;
-  const records = await getMatrixForAircraft(currentAircraftId);
-  matrixData = {};
-  for (const r of records) {
-    const key = `${r.densityAltitude}_${r.powerSetting}`;
-    if (!matrixData[key] || r.timestamp > matrixData[key].timestamp) {
-      matrixData[key] = r;
-    }
-  }
+  aggregateMatrix = await getAggregateMatrix(currentAircraftId);
   renderMatrix();
+}
+
+function getCellValue(cell) {
+  if (!cell) return null;
+  switch (activeTab) {
+    case 'tas':   return cell.tas   != null ? { primary: `${cell.tas} kts`,    sub: `${cell.mapInhg}" / ${cell.rpm} RPM` } : null;
+    case 'range': return cell.specificRange != null ? { primary: `${cell.specificRange} nm/gal`, sub: `${cell.fuelFlow} GPH` } : null;
+    case 'fuel':  return cell.fuelFlow != null ? { primary: `${cell.fuelFlow} GPH`, sub: `${cell.tas} kts TAS` } : null;
+    case 'cht':   return cell.chtMax != null ? { primary: `${cell.chtMax}°F`, sub: cell.chtSpread ? `±${Math.round(cell.chtSpread/2)}° spread` : '' } : null;
+  }
+  return null;
+}
+
+function chtColor(chtMax) {
+  if (!chtMax) return 'green';
+  if (chtMax >= 420) return 'red';
+  if (chtMax >= 390) return 'yellow';
+  return 'green';
 }
 
 function renderMatrix() {
@@ -186,113 +215,111 @@ function renderMatrix() {
   grid.innerHTML = '';
 
   // Header row
-  const headerRow = document.createElement('div');
-  headerRow.className = 'contents';
-  const corner = document.createElement('div');
-  corner.className = 'sticky left-0 bg-gray-800 text-gray-400 text-xs font-bold p-2 border-b border-r border-gray-700 flex items-end';
-  corner.textContent = 'DA (ft) / Power';
-  headerRow.appendChild(corner);
+  const makeDiv = (cls, content = '') => {
+    const d = document.createElement('div');
+    d.className = cls;
+    d.innerHTML = content;
+    return d;
+  };
+
+  grid.appendChild(makeDiv(
+    'sticky left-0 bg-gray-800 text-gray-400 text-xs font-bold p-2 border-b border-r border-gray-700 flex items-end',
+    'DA / Power'
+  ));
   for (const pwr of PWR_BUCKETS) {
-    const th = document.createElement('div');
-    th.className = 'bg-gray-800 text-gray-300 text-xs font-bold p-2 border-b border-gray-700 text-center';
-    th.textContent = pwr === 'WOT' ? 'WOT' : `${pwr}%`;
-    headerRow.appendChild(th);
+    grid.appendChild(makeDiv(
+      'bg-gray-800 text-gray-300 text-xs font-bold p-2 border-b border-gray-700 text-center',
+      pwr === 'WOT' ? 'WOT' : `${pwr}%`
+    ));
   }
-  grid.appendChild(headerRow);
 
-  // Data rows
+  // Data rows (highest DA at top)
   for (const da of [...DA_BUCKETS].reverse()) {
-    const row = document.createElement('div');
-    row.className = 'contents';
-
-    const rowLabel = document.createElement('div');
-    rowLabel.className = 'sticky left-0 bg-gray-800 text-gray-300 text-xs font-semibold p-2 border-r border-gray-700 flex items-center';
-    rowLabel.textContent = `${da.toLocaleString()} ft`;
-    row.appendChild(rowLabel);
+    grid.appendChild(makeDiv(
+      'sticky left-0 bg-gray-800 text-gray-300 text-xs font-semibold p-2 border-r border-gray-700 flex items-center',
+      `${da.toLocaleString()} ft`
+    ));
 
     for (const pwr of PWR_BUCKETS) {
       const key = `${da}_${pwr}`;
-      const rec = matrixData[key];
-      const cell = document.createElement('div');
-      cell.className = 'border border-gray-700 p-2 text-center text-xs cursor-pointer transition-colors min-w-[100px]';
+      const cell = aggregateMatrix[key];
+      const val = getCellValue(cell);
+      const div = document.createElement('div');
+      div.className = 'border border-gray-700 p-2 text-center text-xs cursor-pointer transition-colors min-w-[110px]';
 
-      if (rec) {
-        cell.classList.add('bg-green-900', 'hover:bg-green-800');
-        cell.innerHTML = `
-          <div class="font-bold text-green-300">${rec.tas} kts</div>
-          <div class="text-gray-400">${rec.mapInhg} InHg / ${rec.rpm} RPM</div>
-          <div class="text-gray-500">${rec.fuelFlowGph} GPH</div>
+      if (val) {
+        const col = activeTab === 'cht' ? chtColor(cell.chtMax) : 'green';
+        const colorMap = {
+          green:  ['bg-green-900',  'hover:bg-green-800',  'text-green-300'],
+          blue:   ['bg-blue-900',   'hover:bg-blue-800',   'text-blue-300'],
+          purple: ['bg-purple-900', 'hover:bg-purple-800', 'text-purple-300'],
+          red:    ['bg-red-900',    'hover:bg-red-800',    'text-red-300'],
+          yellow: ['bg-yellow-900', 'hover:bg-yellow-800', 'text-yellow-300'],
+        };
+        const [bg, hbg, text] = colorMap[col];
+        div.classList.add(bg, hbg);
+        div.innerHTML = `
+          <div class="font-bold ${text}">${val.primary}</div>
+          ${val.sub ? `<div class="text-gray-400 mt-0.5">${val.sub}</div>` : ''}
+          <div class="text-gray-600 mt-1">N=${cell.count}</div>
         `;
-        cell.title = `TAS: ${rec.tas} kts | OAT: ${rec.oat}°C | FF: ${rec.fuelFlowGph} GPH\n${rec.timestamp}`;
-        cell.addEventListener('click', () => showRecordDetail(rec));
+        div.addEventListener('click', () => showCellDetail(cell));
       } else {
-        cell.classList.add('bg-gray-900', 'hover:bg-gray-700');
-        cell.innerHTML = '<span class="text-gray-600">—</span>';
+        div.classList.add('bg-gray-900', 'hover:bg-gray-700');
+        div.innerHTML = '<span class="text-gray-600">—</span>';
       }
-      row.appendChild(cell);
+      grid.appendChild(div);
     }
-    grid.appendChild(row);
   }
 
-  updateMatrixStats();
+  updateStats();
 }
 
-function updateMatrixStats() {
+function updateStats() {
   const total = DA_BUCKETS.length * PWR_BUCKETS.length;
-  const filled = Object.keys(matrixData).length;
-  const missing = total - filled;
+  const filled = Object.keys(aggregateMatrix).length;
   document.getElementById('stat-filled').textContent = filled;
-  document.getElementById('stat-missing').textContent = missing;
+  document.getElementById('stat-missing').textContent = total - filled;
   document.getElementById('stat-total').textContent = total;
-  document.getElementById('btn-print-card').disabled = missing === 0;
+  document.getElementById('btn-print-card').disabled = filled === total;
+
+  // Sample count summary
+  const totalSamples = Object.values(aggregateMatrix).reduce((s, c) => s + c.count, 0);
+  document.getElementById('stat-samples').textContent = totalSamples;
 }
 
-function showRecordDetail(rec) {
-  const dlg = document.getElementById('modal-detail');
+function showCellDetail(cell) {
+  const fmt = (v, unit) => v != null && !isNaN(v) ? `${v} ${unit}` : '—';
   document.getElementById('detail-content').innerHTML = `
-    <table class="w-full text-sm text-left border-collapse">
-      <tbody>
+    <table class="w-full text-sm text-left">
+      <tbody class="divide-y divide-gray-700">
         ${[
-          ['Timestamp', rec.timestamp],
-          ['Density Altitude Bucket', `${rec.densityAltitude.toLocaleString()} ft`],
-          ['Power Setting', rec.powerSetting === 'WOT' ? 'WOT' : `${rec.powerSetting}%`],
-          ['TAS', `${rec.tas} kts`],
-          ['IAS', `${rec.ias} kts`],
-          ['MAP', `${rec.mapInhg} InHg`],
-          ['RPM', rec.rpm],
-          ['Fuel Flow', `${rec.fuelFlowGph} GPH`],
-          ['OAT', `${rec.oat} °C`],
-        ].map(([k,v]) => `<tr class="border-b border-gray-700">
-          <td class="py-1 pr-4 text-gray-400 font-medium">${k}</td>
-          <td class="py-1 text-gray-100">${v}</td>
-        </tr>`).join('')}
+          ['Density Altitude', `${cell.densityAltitude.toLocaleString()} ft`],
+          ['Power Setting', cell.powerSetting === 'WOT' ? 'WOT' : `${cell.powerSetting}%`],
+          ['Flights averaged (N)', cell.count],
+          ['TAS', fmt(cell.tas, 'kts')],
+          ['Specific Range', fmt(cell.specificRange, 'nm/gal')],
+          ['Fuel Flow', fmt(cell.fuelFlow, 'GPH')],
+          ['MAP', fmt(cell.mapInhg, 'InHg')],
+          ['RPM', fmt(cell.rpm, '')],
+          ['Max CHT (avg)', fmt(cell.chtMax, '°F')],
+          ['CHT Spread (avg)', fmt(cell.chtSpread, '°F')],
+          ['EGT Spread (avg)', fmt(cell.egtSpread, '°F')],
+        ].map(([k,v]) => `<tr><td class="py-1.5 pr-4 text-gray-400 font-medium">${k}</td>
+                              <td class="py-1.5 text-gray-100">${v}</td></tr>`).join('')}
       </tbody>
-    </table>
-  `;
+    </table>`;
   showModal('modal-detail');
 }
 
-document.addEventListener('click', e => {
-  if (e.target.id === 'btn-close-detail') hideModal('modal-detail');
-});
-
-// ── Test Card Generation ──────────────────────────────────────────────────────
-
+// ── Test Card ─────────────────────────────────────────────────────────────────
 async function onPrintTestCard() {
   const aircraft = await getAircraft(currentAircraftId);
-  const missing = [];
+  const missing = DA_BUCKETS
+    .map(da => ({ da, pwrs: PWR_BUCKETS.filter(pwr => !aggregateMatrix[`${da}_${pwr}`]) }))
+    .filter(({ pwrs }) => pwrs.length > 0);
 
-  for (const da of DA_BUCKETS) {
-    const missingPwr = PWR_BUCKETS.filter(pwr => !matrixData[`${da}_${pwr}`]);
-    if (missingPwr.length > 0) {
-      missing.push({ da, pwrs: missingPwr });
-    }
-  }
-
-  if (missing.length === 0) {
-    showToast('Matrix is complete — no test card needed!');
-    return;
-  }
+  if (!missing.length) { showToast('Matrix complete — no test card needed!'); return; }
 
   const lines = [
     `FLIGHT TEST CARD: ${aircraft.tailNumber} PROFILE COMPLETION`,
@@ -308,45 +335,30 @@ async function onPrintTestCard() {
     pwrs.forEach((pwr, i) => {
       const { mapHint, rpmHint } = getPowerHint(pwr, da);
       const label = pwr === 'WOT' ? 'WOT (full throttle)' : `${pwr}% Power`;
-      lines.push(`[ ] Point ${i+1}: ${label}${mapHint ? ` (~${mapHint} / ${rpmHint})` : ''}`);
+      lines.push(`[ ] Point ${i + 1}: ${label}${mapHint ? ` (~${mapHint} / ${rpmHint})` : ''}`);
       lines.push(`    Action: Stabilize for 3 minutes. Record on Garmin G3X.`);
     });
     lines.push('');
   }
 
-  const card = lines.join('\n');
-  document.getElementById('test-card-content').textContent = card;
+  document.getElementById('test-card-content').textContent = lines.join('\n');
   showModal('modal-test-card');
 }
 
 function getPowerHint(pwr, da) {
-  // Rough MAP hints for normally-aspirated engines at altitude
-  // These are illustrative — actual values depend on the aircraft POH
-  const ambientApprox = 29.92 * Math.pow(1 - 6.8755856e-6 * da, 5.2558797);
-  if (pwr === 'WOT') {
-    return { mapHint: `${ambientApprox.toFixed(1)} InHg`, rpmHint: 'Full RPM' };
-  }
-  const targetMap = (pwr / 100) * ambientApprox * 1.15; // rough estimate
-  return { mapHint: `${Math.min(targetMap, ambientApprox).toFixed(1)} InHg`, rpmHint: `~${2200 + (pwr - 55) * 10} RPM` };
+  const ap = 29.92 * Math.pow(1 - 6.8755856e-6 * da, 5.2558797);
+  if (pwr === 'WOT') return { mapHint: `${ap.toFixed(1)} InHg`, rpmHint: 'Full RPM' };
+  const mapEst = Math.min((pwr / 100) * ap * 1.15, ap).toFixed(1);
+  return { mapHint: `${mapEst} InHg`, rpmHint: `~${2200 + (pwr - 55) * 10} RPM` };
 }
 
-document.addEventListener('click', e => {
-  if (e.target.id === 'btn-close-card') hideModal('modal-test-card');
-  if (e.target.id === 'btn-print') window.print();
-  if (e.target.id === 'btn-download-card') downloadCard();
-});
-
 function downloadCard() {
-  const text = document.getElementById('test-card-content').textContent;
-  const blob = new Blob([text], { type: 'text/plain' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'flight-test-card.txt';
+  const blob = new Blob([document.getElementById('test-card-content').textContent], { type: 'text/plain' });
+  const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: 'flight-test-card.txt' });
   a.click();
 }
 
 // ── Import ────────────────────────────────────────────────────────────────────
-
 async function onImport(e) {
   const file = e.target.files[0];
   if (!file) return;
@@ -362,26 +374,24 @@ async function onImport(e) {
 }
 
 // ── Utility ───────────────────────────────────────────────────────────────────
-
 function showModal(id) {
-  document.getElementById(id).classList.remove('hidden');
-  document.getElementById(id).classList.add('flex');
+  const el = document.getElementById(id);
+  el.classList.remove('hidden');
+  el.classList.add('flex');
 }
-
 function hideModal(id) {
-  document.getElementById(id).classList.add('hidden');
-  document.getElementById(id).classList.remove('flex');
+  const el = document.getElementById(id);
+  el.classList.add('hidden');
+  el.classList.remove('flex');
 }
 
 let toastTimer;
 function showToast(msg, type = 'info') {
-  const toast = document.getElementById('toast');
-  const bg = type === 'error' ? 'bg-red-800' : type === 'warn' ? 'bg-yellow-800' : 'bg-blue-800';
-  toast.className = `fixed bottom-6 right-6 text-white text-sm px-4 py-3 rounded-lg shadow-lg z-50 max-w-sm ${bg}`;
-  toast.textContent = msg;
-  toast.classList.remove('hidden');
+  const bg = { error: 'bg-red-800', warn: 'bg-yellow-800', info: 'bg-blue-800' }[type];
+  const el = document.getElementById('toast');
+  el.className = `fixed bottom-6 right-6 text-white text-sm px-4 py-3 rounded-lg shadow-lg z-50 max-w-sm ${bg}`;
+  el.textContent = msg;
+  el.classList.remove('hidden');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toast.classList.add('hidden'), 5000);
+  toastTimer = setTimeout(() => el.classList.add('hidden'), 5000);
 }
-
-export { renderAircraftList };

@@ -1,4 +1,3 @@
-// Dexie.js IndexedDB wrapper
 import Dexie from 'https://cdn.jsdelivr.net/npm/dexie@4/+esm';
 import { exportDB, importInto } from 'https://cdn.jsdelivr.net/npm/dexie-export-import@4/+esm';
 
@@ -8,7 +7,9 @@ class FlightProfilerDB extends Dexie {
     this.version(1).stores({
       aircraft: '++id, tailNumber, model',
       flights: 'id, aircraftId, date, status',
-      performanceMatrix: '++id, aircraftId, densityAltitude, powerSetting',
+      // Each row is one steady-state block from one flight — never overwritten.
+      // Aggregate queries average across all rows per (aircraftId, da, pwr) bucket.
+      performanceMatrix: '++id, aircraftId, flightId, densityAltitude, powerSetting',
     });
   }
 }
@@ -46,26 +47,74 @@ export async function saveFlight(flight) {
 }
 
 export async function listFlights(aircraftId) {
-  return db.flights.where('aircraftId').equals(aircraftId).toArray();
+  return db.flights.where('aircraftId').equals(aircraftId).reverse().sortBy('date');
 }
 
-export async function deleteFlight(id) {
-  await db.flights.delete(id);
+export async function deleteFlight(flightId) {
+  await db.flights.delete(flightId);
+  await db.performanceMatrix.where('flightId').equals(flightId).delete();
 }
 
 // ── Performance Matrix ────────────────────────────────────────────────────────
 
-export async function upsertPerformanceRecords(records) {
-  return db.performanceMatrix.bulkPut(records);
+// Append new steady-state blocks; never overwrites existing data.
+export async function addPerformanceRecords(records) {
+  return db.performanceMatrix.bulkAdd(records);
 }
 
-export async function getMatrixForAircraft(aircraftId) {
-  return db.performanceMatrix.where('aircraftId').equals(aircraftId).toArray();
+// Returns a map: key → { tas, specificRange, fuelFlow, chtMax, chtAvg, chtSpread,
+//                        egtSpread, count, samples: [...raw] }
+// where key = `${densityAltitude}_${powerSetting}`
+export async function getAggregateMatrix(aircraftId) {
+  const rows = await db.performanceMatrix.where('aircraftId').equals(aircraftId).toArray();
+
+  const buckets = {};
+  for (const r of rows) {
+    const key = `${r.densityAltitude}_${r.powerSetting}`;
+    if (!buckets[key]) {
+      buckets[key] = {
+        densityAltitude: r.densityAltitude,
+        powerSetting: r.powerSetting,
+        samples: [],
+      };
+    }
+    buckets[key].samples.push(r);
+  }
+
+  const aggregate = {};
+  for (const [key, bucket] of Object.entries(buckets)) {
+    const s = bucket.samples;
+    const n = s.length;
+    const avg = (fn) => s.reduce((sum, r) => sum + (fn(r) || 0), 0) / n;
+
+    // CHT max per sample → average of those maxima across flights
+    const chtMaxes = s.map(r => r.chtMax).filter(v => v > 0);
+    const chtAvgs  = s.map(r => r.chtAvg).filter(v => v > 0);
+    const chtSpreads = s.map(r => r.chtSpread).filter(v => v > 0);
+    const egtSpreads = s.map(r => r.egtSpread).filter(v => v > 0);
+    const srs = s.map(r => r.specificRange).filter(v => v > 0);
+
+    aggregate[key] = {
+      densityAltitude: bucket.densityAltitude,
+      powerSetting: bucket.powerSetting,
+      count: n,
+      tas: round1(avg(r => r.tas)),
+      specificRange: srs.length ? round1(srs.reduce((a, b) => a + b, 0) / srs.length) : null,
+      fuelFlow: round2(avg(r => r.fuelFlowGph)),
+      chtMax: chtMaxes.length ? Math.round(chtMaxes.reduce((a, b) => a + b, 0) / chtMaxes.length) : null,
+      chtAvg: chtAvgs.length ? round1(chtAvgs.reduce((a, b) => a + b, 0) / chtAvgs.length) : null,
+      chtSpread: chtSpreads.length ? Math.round(chtSpreads.reduce((a, b) => a + b, 0) / chtSpreads.length) : null,
+      egtSpread: egtSpreads.length ? Math.round(egtSpreads.reduce((a, b) => a + b, 0) / egtSpreads.length) : null,
+      mapInhg: round2(avg(r => r.mapInhg)),
+      rpm: Math.round(avg(r => r.rpm)),
+    };
+  }
+
+  return aggregate;
 }
 
-export async function deleteMatrixForFlight(flightId) {
-  return db.performanceMatrix.where('flightId').equals(flightId).delete();
-}
+function round1(v) { return Math.round(v * 10) / 10; }
+function round2(v) { return Math.round(v * 100) / 100; }
 
 // ── Backup / Restore ──────────────────────────────────────────────────────────
 
@@ -85,21 +134,21 @@ export async function importDatabase(file) {
   await importInto(db, file, { clearTablesBeforeImport: true });
 }
 
-// DA bucket boundaries
-export const DA_BUCKETS = [2000, 4000, 6000, 8000, 10000, 12000, 14000];
-export const DA_TOL = 500;
-export const PWR_BUCKETS = [55, 65, 75, 'WOT'];
-export const PWR_TOL = 2; // ±2%
+// ── Bucketing constants ───────────────────────────────────────────────────────
+
+export const DA_BUCKETS   = [2000, 4000, 6000, 8000, 10000, 12000, 14000];
+export const DA_TOL       = 500;
+export const PWR_BUCKETS  = [55, 65, 75, 'WOT'];
+export const PWR_TOL      = 2;
 
 export function getDaBucket(densityAltitude) {
-  for (const bucket of DA_BUCKETS) {
-    if (Math.abs(densityAltitude - bucket) <= DA_TOL) return bucket;
+  for (const b of DA_BUCKETS) {
+    if (Math.abs(densityAltitude - b) <= DA_TOL) return b;
   }
   return null;
 }
 
 export function getPowerBucket(powerPercent, mapInhg, ambientPressureInhg) {
-  // Check WOT: MAP within 0.3 InHg of ambient
   if (ambientPressureInhg && mapInhg >= ambientPressureInhg - 0.3) return 'WOT';
   for (const pwr of [55, 65, 75]) {
     if (Math.abs(powerPercent - pwr) <= PWR_TOL) return pwr;
