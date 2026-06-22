@@ -39,6 +39,12 @@ export async function saveFlight(flight) { return db.flights.put(flight); }
 export async function listFlights(aircraftId) {
   return db.flights.where('aircraftId').equals(aircraftId).reverse().sortBy('date');
 }
+
+// Fingerprints of flights already ingested for an aircraft, for de-duplication.
+export async function getFlightFingerprints(aircraftId) {
+  const flights = await db.flights.where('aircraftId').equals(aircraftId).toArray();
+  return new Set(flights.map(f => f.contentHash).filter(Boolean));
+}
 export async function deleteFlight(flightId) {
   await db.flights.delete(flightId);
   await db.performanceMatrix.where('flightId').equals(flightId).delete();

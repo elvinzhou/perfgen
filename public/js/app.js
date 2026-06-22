@@ -1,11 +1,12 @@
 import {
   db, saveAircraft, getAircraft, listAircraft, deleteAircraft,
-  saveFlight, listFlights, deleteFlight,
+  saveFlight, listFlights, deleteFlight, getFlightFingerprints,
   addPerformanceRecords, getAggregateMatrix,
   exportDatabase, importDatabase,
 } from './db.js';
 import { DA_BUCKETS, PWR_BUCKETS, getDaBucket, getPowerBucket } from './buckets.js';
 import { processCSV, loadWasm } from './wasm-bridge.js';
+import { fingerprintCsv } from './dedupe.js';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let currentAircraftId = null;
@@ -52,9 +53,28 @@ function bindEvents() {
   document.getElementById('form-aircraft').addEventListener('submit', onSaveAircraft);
   document.getElementById('btn-cancel-aircraft').addEventListener('click', () => hideModal('modal-aircraft'));
 
-  document.getElementById('btn-upload-csv').addEventListener('click', () =>
-    document.getElementById('input-csv').click());
+  const dropzone = document.getElementById('dropzone');
+  dropzone.addEventListener('click', () => document.getElementById('input-csv').click());
   document.getElementById('input-csv').addEventListener('change', onCSVSelected);
+
+  // Drag & drop onto the upload zone
+  const setDragActive = on => {
+    dropzone.classList.toggle('border-green-500', on);
+    dropzone.classList.toggle('bg-gray-800/50', on);
+  };
+  ['dragenter', 'dragover'].forEach(ev =>
+    dropzone.addEventListener(ev, e => { e.preventDefault(); setDragActive(true); }));
+  ['dragleave', 'dragend'].forEach(ev =>
+    dropzone.addEventListener(ev, e => { e.preventDefault(); setDragActive(false); }));
+  dropzone.addEventListener('drop', e => {
+    e.preventDefault();
+    setDragActive(false);
+    if (e.dataTransfer?.files?.length) processFiles(e.dataTransfer.files);
+  });
+
+  // Prevent the browser from navigating away if a file is dropped off-target
+  ['dragover', 'drop'].forEach(ev =>
+    window.addEventListener(ev, e => { if (e.target !== dropzone) e.preventDefault(); }));
 
   document.getElementById('btn-export').addEventListener('click', exportDatabase);
   document.getElementById('btn-import').addEventListener('click', () =>
@@ -112,46 +132,33 @@ async function onSaveAircraft(e) {
 }
 
 // ── CSV Upload ────────────────────────────────────────────────────────────────
-async function onCSVSelected(e) {
-  const file = e.target.files[0];
-  if (!file || !currentAircraftId) return;
-  e.target.value = '';
+function onCSVSelected(e) {
+  const files = e.target.files;
+  e.target.value = '';   // reset so re-selecting the same file fires change again
+  processFiles(files);
+}
 
-  const aircraft = await getAircraft(currentAircraftId);
-  showToast('Processing CSV…');
+function makeFlightId() {
+  return crypto.randomUUID
+    ? `flight-${crypto.randomUUID()}`
+    : `flight-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
 
-  const text = await file.text();
-  const result = await processCSV(text, aircraft.maxHp || 0);
-
-  if (result.error) { showToast(`Error: ${result.error}`, 'error'); return; }
-  if (!result.steady_state_blocks.length) {
-    showToast('No steady-state cruise phases found.', 'warn'); return;
-  }
-
-  const flight = {
-    id: `flight-${Date.now()}`,
-    aircraftId: currentAircraftId,
-    date: new Date().toISOString().slice(0, 10),
-    filename: file.name,
-    totalRecords: result.total_records,
-    skippedRecords: result.skipped_records,
-    steadyBlocks: result.steady_state_blocks.length,
-    status: 'processed',
-    processedAt: new Date().toISOString(),
-  };
-  await saveFlight(flight);
-
-  // Build performance records and accumulate into the matrix pool
-  const perfRecords = [];
+// Map a result's steady-state blocks to performance records for one flight.
+// Returns { records, outOfGrid } where outOfGrid counts blocks whose
+// DA/power fell outside the target grid (and so don't affect the matrix).
+function buildPerfRecords(result, flightId) {
+  const records = [];
+  let outOfGrid = 0;
   for (const block of result.steady_state_blocks) {
     const daBucket = getDaBucket(block.density_altitude);
     const ambientP = 29.92 * Math.pow(1 - 6.8755856e-6 * block.pres_alt, 5.2558797);
     const pwrBucket = getPowerBucket(block.power_percent, block.map_inhg, ambientP);
-    if (!daBucket || !pwrBucket) continue;
+    if (!daBucket || !pwrBucket) { outOfGrid++; continue; }
 
-    perfRecords.push({
+    records.push({
       aircraftId: currentAircraftId,
-      flightId: flight.id,
+      flightId,
       timestamp: block.timestamp,
       densityAltitude: daBucket,
       powerSetting: pwrBucket,
@@ -178,11 +185,83 @@ async function onCSVSelected(e) {
       }],
     });
   }
+  return { records, outOfGrid };
+}
 
-  if (perfRecords.length) await addPerformanceRecords(perfRecords);
+async function processFiles(fileList) {
+  if (!currentAircraftId) { showToast('Select an aircraft first.', 'warn'); return; }
 
-  showToast(`Added ${perfRecords.length} data points from ${result.steady_state_blocks.length} steady-state blocks.`);
+  const files = Array.from(fileList || []).filter(f => /\.csv$/i.test(f.name));
+  if (!files.length) { showToast('No CSV files to upload.', 'warn'); return; }
+
+  const aircraft = await getAircraft(currentAircraftId);
+  // Fingerprints already in the DB — plus any seen earlier in this same batch —
+  // so a duplicate flight is never counted twice in the averaged matrix.
+  const seen = await getFlightFingerprints(currentAircraftId);
+
+  showToast(`Processing ${files.length} file${files.length === 1 ? '' : 's'}…`);
+
+  let addedPoints = 0, newFlights = 0, duplicates = 0, outOfGrid = 0, noSteady = 0;
+  const errors = [];
+
+  for (const file of files) {
+    let text;
+    try { text = await file.text(); }
+    catch { errors.push(`${file.name}: unreadable`); continue; }
+
+    const fingerprint = fingerprintCsv(text);
+    if (seen.has(fingerprint)) { duplicates++; continue; }
+    seen.add(fingerprint);
+
+    const result = await processCSV(text, aircraft.maxHp || 0);
+    if (result.error) { errors.push(`${file.name}: ${result.error}`); continue; }
+    if (!result.steady_state_blocks.length) { noSteady++; continue; }
+
+    const flight = {
+      id: makeFlightId(),
+      aircraftId: currentAircraftId,
+      date: new Date().toISOString().slice(0, 10),
+      filename: file.name,
+      contentHash: fingerprint,
+      totalRecords: result.total_records,
+      skippedRecords: result.skipped_records,
+      steadyBlocks: result.steady_state_blocks.length,
+      status: 'processed',
+      processedAt: new Date().toISOString(),
+    };
+
+    const { records, outOfGrid: og } = buildPerfRecords(result, flight.id);
+    outOfGrid += og;
+
+    await saveFlight(flight);
+    if (records.length) await addPerformanceRecords(records);
+    addedPoints += records.length;
+    newFlights++;
+  }
+
   await loadMatrix();
+  showToast(uploadSummary({ addedPoints, newFlights, duplicates, outOfGrid, noSteady, errors }),
+            errors.length ? 'warn' : 'info');
+}
+
+// Build a clear, non-misleading completion message. The matrix only changes
+// when data points are added, so duplicates and out-of-grid blocks are called
+// out explicitly rather than hidden behind an ambiguous "added 0 points".
+function uploadSummary({ addedPoints, newFlights, duplicates, outOfGrid, noSteady, errors }) {
+  const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+  const parts = [];
+
+  if (newFlights) {
+    parts.push(`Added ${plural(addedPoints, 'data point')} from ${plural(newFlights, 'flight')}`);
+  } else {
+    parts.push('No new data points added');
+  }
+  if (duplicates) parts.push(`skipped ${plural(duplicates, 'duplicate')} (already uploaded — matrix unchanged)`);
+  if (outOfGrid)  parts.push(`${plural(outOfGrid, 'block')} outside the DA/power grid`);
+  if (noSteady)   parts.push(`${plural(noSteady, 'file')} had no steady cruise`);
+  if (errors.length) parts.push(errors.length <= 2 ? errors.join('; ') : `${plural(errors.length, 'file')} failed`);
+
+  return parts.join(' · ');
 }
 
 // ── Aggregate Matrix ──────────────────────────────────────────────────────────
