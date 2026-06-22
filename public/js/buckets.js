@@ -15,9 +15,14 @@ export function getDaBucket(densityAltFt) {
   return null;
 }
 
-// WOT when MAP is within 0.3 InHg of ambient (throttle fully open for that altitude)
-export function getPowerBucket(powerPercent, mapInhg, ambientPressureInhg) {
-  if (ambientPressureInhg != null && mapInhg >= ambientPressureInhg - 0.3) return 'WOT';
+// Power is bucketed on the G3X's own computed percent power (E1 %Pwr) — the
+// number the pilot actually flies to. WOT is treated as the top band: anything
+// above the 75% bucket, since at a given altitude full throttle is simply the
+// highest attainable power. (No MAP-vs-ambient guess, which broke on boosted
+// engines and mis-detected full throttle on normally-aspirated ones.)
+export function getPowerBucket(powerPercent) {
+  if (powerPercent == null || isNaN(powerPercent)) return null;
+  if (powerPercent > 75 + PWR_TOL) return 'WOT';
   for (const pwr of [55, 65, 75]) {
     if (Math.abs(powerPercent - pwr) <= PWR_TOL) return pwr;
   }
