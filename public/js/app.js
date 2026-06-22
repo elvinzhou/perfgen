@@ -133,7 +133,9 @@ async function onSaveAircraft(e) {
 
 // ── CSV Upload ────────────────────────────────────────────────────────────────
 function onCSVSelected(e) {
-  const files = e.target.files;
+  // Snapshot the File refs BEFORE resetting the input: `value = ''` clears the
+  // live FileList, which would otherwise leave processFiles with nothing.
+  const files = Array.from(e.target.files);
   e.target.value = '';   // reset so re-selecting the same file fires change again
   processFiles(files);
 }
