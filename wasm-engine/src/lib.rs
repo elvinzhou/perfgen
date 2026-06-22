@@ -59,6 +59,10 @@ pub struct ProcessingResult {
     pub total_records: usize,
     pub skipped_records: usize,
     pub error: Option<String>,
+    // First/last in-flight record timestamps — the flight's time range, used by
+    // the app layer to recognise the same flight recorded on a second SD card.
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
 }
 
 // ── Atmospheric math (fallbacks when G3X pre-computed values are absent) ──────
@@ -269,6 +273,8 @@ pub fn process_csv_inner(csv_data: &str, _max_hp: f64) -> ProcessingResult {
         total_records: 0,
         skipped_records: 0,
         error: None,
+        start_time: None,
+        end_time: None,
     };
 
     let lines: Vec<&str> = csv_data.lines().collect();
@@ -417,6 +423,18 @@ pub fn process_csv_inner(csv_data: &str, _max_hp: f64) -> ProcessingResult {
 
     result.total_records = records.len();
     result.skipped_records = skipped;
+
+    // Flight time range = first/last in-flight record timestamps (if present).
+    if let Some(first) = records.first() {
+        if !first.timestamp.trim().is_empty() {
+            result.start_time = Some(first.timestamp.clone());
+        }
+    }
+    if let Some(last) = records.last() {
+        if !last.timestamp.trim().is_empty() {
+            result.end_time = Some(last.timestamp.clone());
+        }
+    }
 
     if records.len() < WINDOW_SECONDS {
         result.error = Some(format!(
@@ -659,5 +677,14 @@ mod tests {
         // GndSpd = IAS = 140, FFlow = 12 → SR = 140/12 ≈ 11.67
         assert!((block.specific_range - (140.0 / 12.0)).abs() < 0.5,
             "SR {} should ≈ {}", block.specific_range, 140.0/12.0);
+    }
+
+    #[test]
+    fn csv_reports_flight_time_range() {
+        // 190 rows → 00:00:00 through 00:03:09
+        let csv = make_csv(WINDOW_SECONDS + 10, 8000.0, 140.0, 22.5, 2400.0);
+        let result = process_csv_inner(&csv, 0.0);
+        assert_eq!(result.start_time.as_deref(), Some("2026-01-01 00:00:00"));
+        assert_eq!(result.end_time.as_deref(), Some("2026-01-01 00:03:09"));
     }
 }
