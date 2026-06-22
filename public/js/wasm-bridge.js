@@ -171,5 +171,14 @@ export function jsFallback(csvText, _maxHp) {
   }
   if (inSteady) blocks.push(buildResult(avgBlock(records.slice(bStart))));
 
-  return { steady_state_blocks:blocks, total_records:records.length, skipped_records:skipped, error:null };
+  return {
+    steady_state_blocks: blocks,
+    total_records: records.length,
+    skipped_records: skipped,
+    error: null,
+    // First/last in-flight record timestamps — the flight's time range, used
+    // to recognise the same flight recorded on a second G3X/SD card.
+    start_time: records[0]?.timestamp || null,
+    end_time: records[records.length - 1]?.timestamp || null,
+  };
 }

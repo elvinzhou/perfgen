@@ -165,3 +165,12 @@ describe('jsFallback — steady-state extraction', () => {
     expect(r.steady_state_blocks).toHaveLength(0);
   });
 });
+
+describe('jsFallback — flight time range', () => {
+  it('reports first and last in-flight record timestamps', () => {
+    const csv = makeCSV({ rows: 250 });   // 00:00:00 → 00:04:09
+    const r = jsFallback(csv, 0);
+    expect(r.start_time).toBe('2026-01-01 00:00:00');
+    expect(r.end_time).toBe('2026-01-01 00:04:09');
+  });
+});

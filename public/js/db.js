@@ -40,10 +40,15 @@ export async function listFlights(aircraftId) {
   return db.flights.where('aircraftId').equals(aircraftId).reverse().sortBy('date');
 }
 
-// Fingerprints of flights already ingested for an aircraft, for de-duplication.
-export async function getFlightFingerprints(aircraftId) {
+// De-duplication info for flights already ingested for an aircraft: the
+// content fingerprint plus the flight's time range (epoch ms, or null).
+export async function getFlightDedupeInfo(aircraftId) {
   const flights = await db.flights.where('aircraftId').equals(aircraftId).toArray();
-  return new Set(flights.map(f => f.contentHash).filter(Boolean));
+  return flights.map(f => ({
+    contentHash: f.contentHash ?? null,
+    startMs: f.startMs ?? null,
+    endMs: f.endMs ?? null,
+  }));
 }
 export async function deleteFlight(flightId) {
   await db.flights.delete(flightId);

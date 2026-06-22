@@ -1,12 +1,12 @@
 import {
   db, saveAircraft, getAircraft, listAircraft, deleteAircraft,
-  saveFlight, listFlights, deleteFlight, getFlightFingerprints,
+  saveFlight, listFlights, deleteFlight, getFlightDedupeInfo,
   addPerformanceRecords, getAggregateMatrix,
   exportDatabase, importDatabase,
 } from './db.js';
 import { DA_BUCKETS, PWR_BUCKETS, getDaBucket, getPowerBucket } from './buckets.js';
 import { processCSV, loadWasm } from './wasm-bridge.js';
-import { fingerprintCsv } from './dedupe.js';
+import { fingerprintCsv, parseG3xTimestamp, timeRangesOverlap } from './dedupe.js';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let currentAircraftId = null;
@@ -195,9 +195,12 @@ async function processFiles(fileList) {
   if (!files.length) { showToast('No CSV files to upload.', 'warn'); return; }
 
   const aircraft = await getAircraft(currentAircraftId);
-  // Fingerprints already in the DB — plus any seen earlier in this same batch —
-  // so a duplicate flight is never counted twice in the averaged matrix.
-  const seen = await getFlightFingerprints(currentAircraftId);
+  // Dedupe state, seeded from the DB and grown as we ingest this batch, so a
+  // duplicate flight is never counted twice in the averaged matrix. We catch
+  // two forms: an identical file (content fingerprint) and the same flight
+  // recorded on a second G3X/SD card (overlapping time range).
+  const index = await getFlightDedupeInfo(currentAircraftId);
+  const seenHashes = new Set(index.map(f => f.contentHash).filter(Boolean));
 
   showToast(`Processing ${files.length} file${files.length === 1 ? '' : 's'}…`);
 
@@ -210,12 +213,20 @@ async function processFiles(fileList) {
     catch { errors.push(`${file.name}: unreadable`); continue; }
 
     const fingerprint = fingerprintCsv(text);
-    if (seen.has(fingerprint)) { duplicates++; continue; }
-    seen.add(fingerprint);
+    if (seenHashes.has(fingerprint)) { duplicates++; continue; }
+    seenHashes.add(fingerprint);
 
     const result = await processCSV(text, aircraft.maxHp || 0);
     if (result.error) { errors.push(`${file.name}: ${result.error}`); continue; }
     if (!result.steady_state_blocks.length) { noSteady++; continue; }
+
+    // Same flight from a different recorder: bytes differ, but the time range
+    // overlaps an already-ingested flight. Skip it.
+    const startMs = parseG3xTimestamp(result.start_time);
+    const endMs   = parseG3xTimestamp(result.end_time);
+    if (index.some(f => timeRangesOverlap(startMs, endMs, f.startMs, f.endMs))) {
+      duplicates++; continue;
+    }
 
     const flight = {
       id: makeFlightId(),
@@ -223,6 +234,10 @@ async function processFiles(fileList) {
       date: new Date().toISOString().slice(0, 10),
       filename: file.name,
       contentHash: fingerprint,
+      startTime: result.start_time ?? null,
+      endTime: result.end_time ?? null,
+      startMs,
+      endMs,
       totalRecords: result.total_records,
       skippedRecords: result.skipped_records,
       steadyBlocks: result.steady_state_blocks.length,
@@ -235,6 +250,7 @@ async function processFiles(fileList) {
 
     await saveFlight(flight);
     if (records.length) await addPerformanceRecords(records);
+    index.push({ contentHash: fingerprint, startMs, endMs });
     addedPoints += records.length;
     newFlights++;
   }
