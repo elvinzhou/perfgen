@@ -154,8 +154,7 @@ function buildPerfRecords(result, flightId) {
   let outOfGrid = 0;
   for (const block of result.steady_state_blocks) {
     const daBucket = getDaBucket(block.density_altitude);
-    const ambientP = 29.92 * Math.pow(1 - 6.8755856e-6 * block.pres_alt, 5.2558797);
-    const pwrBucket = getPowerBucket(block.power_percent, block.map_inhg, ambientP);
+    const pwrBucket = getPowerBucket(block.power_percent);
     if (!daBucket || !pwrBucket) { outOfGrid++; continue; }
 
     records.push({

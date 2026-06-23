@@ -30,30 +30,31 @@ describe('getDaBucket', () => {
 
 describe('getPowerBucket', () => {
   it('returns the correct bucket at exact power settings', () => {
-    expect(getPowerBucket(55, 15, 29)).toBe(55);
-    expect(getPowerBucket(65, 15, 29)).toBe(65);
-    expect(getPowerBucket(75, 15, 29)).toBe(75);
+    expect(getPowerBucket(55)).toBe(55);
+    expect(getPowerBucket(65)).toBe(65);
+    expect(getPowerBucket(75)).toBe(75);
   });
   it('snaps within ±2% tolerance', () => {
-    expect(getPowerBucket(53, 15, 29)).toBe(55);
-    expect(getPowerBucket(57, 15, 29)).toBe(55);
-    expect(getPowerBucket(63, 15, 29)).toBe(65);
-    expect(getPowerBucket(67, 15, 29)).toBe(65);
+    expect(getPowerBucket(53)).toBe(55);
+    expect(getPowerBucket(57)).toBe(55);
+    expect(getPowerBucket(63)).toBe(65);
+    expect(getPowerBucket(67)).toBe(65);
+    expect(getPowerBucket(73)).toBe(75);
+    expect(getPowerBucket(77)).toBe(75); // top of the 75% band, not yet WOT
   });
-  it('returns null outside tolerance and not WOT', () => {
-    expect(getPowerBucket(59, 15, 29)).toBeNull();  // 2% gap between 55 and 65
-    expect(getPowerBucket(50, 15, 29)).toBeNull();
+  it('returns null in the gaps between buckets', () => {
+    expect(getPowerBucket(59)).toBeNull();  // gap between 55 and 65
+    expect(getPowerBucket(70)).toBeNull();  // gap between 65 and 75
+    expect(getPowerBucket(50)).toBeNull();
   });
-  it('returns WOT when MAP is within 0.3 InHg of ambient', () => {
-    expect(getPowerBucket(80, 29.7, 29.92)).toBe('WOT');  // 29.7 >= 29.92-0.3=29.62
-    expect(getPowerBucket(75, 29.65, 29.92)).toBe('WOT'); // 29.65 >= 29.62
+  it('treats anything above the 75% band as WOT', () => {
+    expect(getPowerBucket(78)).toBe('WOT');
+    expect(getPowerBucket(85)).toBe('WOT');
+    expect(getPowerBucket(100)).toBe('WOT');
   });
-  it('does not return WOT when MAP is clearly below ambient', () => {
-    expect(getPowerBucket(75, 25.0, 29.92)).toBe(75);
-    expect(getPowerBucket(75, 29.5, 29.92)).toBe(75); // 29.5 < 29.62
-  });
-  it('prefers WOT over power percentage check', () => {
-    // Even if power% = 65, if MAP is at ambient it should be WOT
-    expect(getPowerBucket(65, 29.7, 29.92)).toBe('WOT');
+  it('returns null for missing or NaN power', () => {
+    expect(getPowerBucket(NaN)).toBeNull();
+    expect(getPowerBucket(null)).toBeNull();
+    expect(getPowerBucket(undefined)).toBeNull();
   });
 });
